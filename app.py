@@ -44,7 +44,7 @@ if st.button("Analyze Article for Targets"):
                 # Configure and call the Gemini API
                 genai.configure(api_key=api_key)
                 # Using Gemini 1.5 Flash as it is extremely fast and cheap for text parsing
-                model = genai.GenerativeModel('gemini-1.5-flash') 
+                model = genai.GenerativeModel('gemini-3.5-flash') 
                 
                 # Combine the rules and the pasted text
                 full_prompt = f"{SYSTEM_PROMPT}\n\nArticle Text:\n{article_text}"
