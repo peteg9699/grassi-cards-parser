@@ -87,24 +87,28 @@ def get_item_watch_count(token, item_id):
 def fetch_sold_comps_auto(api_key, search_query, fallback_ship=6.00):
     """Fetches recent sold listings from SoldComps and returns the last 7 totals + 30-day volume."""
     url = "https://api.sold-comps.com/v1/scrape"
-    headers = {"Authorization": f"Bearer {api_key}"}
-    params = {"keywords": search_query, "site": "US"}
+    headers = {"Authorization": f"Bearer {api_key.strip()}"}
+    params = {"keyword": search_query, "ebaySite": "ebay.com"}
 
     resp = requests.get(url, headers=headers, params=params, timeout=20)
     resp.raise_for_status()
-    items = resp.json().get("items", [])
+    data = resp.json()
+    items = data.get("items") or data.get("results") or []
 
     totals = []
     sold_30d = 0
     cutoff_30d = datetime.now(timezone.utc) - timedelta(days=30)
 
     for item in items:
-        price = float(item.get("price", 0.0) or 0.0)
-        ship = float(item.get("shipping", fallback_ship) or 0.0)
+        raw_price = item.get("soldPrice") or item.get("price") or 0.0
+        raw_ship = item.get("shippingPrice") if item.get("shippingPrice") is not None else item.get("shipping")
+        price = float(raw_price) if raw_price else 0.0
+        ship = float(raw_ship) if raw_ship is not None else fallback_ship
+
         if price > 0:
             totals.append(price + ship)
 
-        sold_date_str = item.get("date") or item.get("sold_date")
+        sold_date_str = item.get("date") or item.get("soldDate") or item.get("sold_date")
         if sold_date_str:
             try:
                 sold_dt = datetime.fromisoformat(sold_date_str.replace("Z", "+00:00"))
