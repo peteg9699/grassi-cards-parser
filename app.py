@@ -19,6 +19,8 @@ DEFAULT_BASE_EXCLUDES = (
     "printing plate, numbered"
 )
 
+RAW_GRADING_EXCLUDES = ["psa", "bgs", "sgc", "cgc", "csg", "hga", "beckett", "graded", "slab", "slabbed"]
+
 def load_secret(key_name):
     """Safely reads from st.secrets without crashing if no secrets file exists."""
     try:
@@ -52,13 +54,14 @@ with st.sidebar:
     st.divider()
     st.header("⚙️ Deal & Filter Settings")
     discount_pct = st.slider("Target Discount Below Comp (%)", 5, 35, 10)
-    default_shipping = st.number_input("Fallback Slab Shipping ($)", value=6.00, step=0.50)
+    default_slab_shipping = st.number_input("Fallback Graded Slab Shipping ($)", value=6.00, step=0.50)
+    default_raw_shipping = st.number_input("Fallback Raw Card Shipping ($)", value=1.50, step=0.50)
     stale_days_threshold = st.number_input("Stale Inventory Threshold (Days)", value=30, step=5)
     casual_seller_max_fb = st.number_input("Casual Seller Max Feedback", value=100, step=25)
     max_auction_bids = st.number_input("Low-Bid Auction Max Bids", value=5, step=1)
     auction_hours_left = st.number_input("Auctions Ending Within (Hours)", value=3, step=1)
 
-# --- Parallel, Card Number & Query Filtering Helpers ---
+# --- Parallel, Card Number, Grade & Query Filtering Helpers ---
 def get_effective_excludes(exclude_csv, player="", card_set="", specific_parallel=""):
     """Prevents an exclusion word from blocking terms that belong to the Set Name or Player Name."""
     if not exclude_csv.strip():
@@ -76,8 +79,8 @@ def get_effective_excludes(exclude_csv, player="", card_set="", specific_paralle
         effective.append(w)
     return effective
 
-def build_search_query(player, card_set, grade, mode, specific_parallel, exclude_csv, card_num=""):
-    """Builds the search query with positive parallel terms, card number, and API negative exclusions."""
+def build_search_query(player, card_set, condition_type, grade, mode, specific_parallel, exclude_csv, card_num=""):
+    """Builds the search query for Graded or Raw cards with card number and negative exclusions."""
     parts = [player.strip()]
     if card_set and card_set.strip():
         parts.append(card_set.strip())
@@ -85,18 +88,27 @@ def build_search_query(player, card_set, grade, mode, specific_parallel, exclude
         parts.append(card_num.strip().lstrip("#").strip())
     if mode == "Specific Parallel" and specific_parallel.strip():
         parts.append(specific_parallel.strip())
-    if grade:
-        parts.append(grade)
+    if condition_type == "Graded" and grade and grade.strip():
+        parts.append(grade.strip())
 
     query = " ".join(parts)
+
+    neg_tokens = []
+    if condition_type == "Raw (Ungraded)":
+        neg_tokens.extend([f"-{g}" for g in ["PSA", "BGS", "SGC", "CGC", "CSG", "HGA", "graded", "slab"]])
 
     if mode in ("Base Only", "Specific Parallel"):
         excludes = get_effective_excludes(exclude_csv, player, card_set, specific_parallel)
         single_word_excludes = [w for w in excludes if " " not in w]
-        neg_tokens = [f"-{w}" for w in single_word_excludes[:18]]
-        candidate = f"{query} {' '.join(neg_tokens)}".strip()
+        neg_tokens.extend([f"-{w}" for w in single_word_excludes])
+
+    # Keep total query safely within eBay's 350-character limit
+    for tok in neg_tokens[:22]:
+        candidate = f"{query} {tok}".strip()
         if len(candidate) <= 320:
             query = candidate
+        else:
+            break
 
     return query
 
@@ -108,9 +120,31 @@ def matches_card_number(title, card_num):
     pattern = rf"(?<!/)(?:^|[\s#(-])#?\s*{re.escape(clean_num)}\b"
     return bool(re.search(pattern, title, re.IGNORECASE))
 
-def matches_parallel_filter(title, mode, specific_parallel, exclude_csv, exclude_numbered, player="", card_set="", card_num=""):
-    """Whole-word title filter that enforces card number and protects Set Name words."""
-    if not title or not matches_card_number(title, card_num):
+def matches_grade_condition(title, condition_type, grade):
+    """Enforces target grade for Graded searches, or rejects slabs for Raw searches."""
+    if condition_type == "Raw (Ungraded)":
+        for g_word in RAW_GRADING_EXCLUDES:
+            if re.search(rf"\b{re.escape(g_word)}\b", title, re.IGNORECASE):
+                return False
+        return True
+
+    if condition_type == "Graded" and grade and grade.strip():
+        grade_parts = [re.escape(p) for p in grade.strip().split()]
+        grade_pattern = r"\b" + r"\s*".join(grade_parts) + r"\b"
+        return bool(re.search(grade_pattern, title, re.IGNORECASE))
+
+    return True
+
+def matches_card_filter(
+    title, condition_type, grade, mode, specific_parallel,
+    exclude_csv, exclude_numbered, player="", card_set="", card_num=""
+):
+    """Whole-word title filter enforcing condition/grade, card number, and parallel rules."""
+    if not title:
+        return False
+    if not matches_grade_condition(title, condition_type, grade):
+        return False
+    if not matches_card_number(title, card_num):
         return False
 
     if mode == "Specific Parallel" and specific_parallel.strip():
@@ -180,10 +214,10 @@ def get_item_watch_count(token, item_id):
     return "N/A"
 
 def fetch_sold_comps_auto(
-    api_key, search_query, fallback_ship, mode, specific_parallel,
+    api_key, search_query, fallback_ship, condition_type, grade, mode, specific_parallel,
     exclude_csv, exclude_numbered, player="", card_set="", card_num=""
 ):
-    """Fetches recent sold listings from SoldComps, filters to exact card & parallel, and returns last 10 comps + 30d volume."""
+    """Fetches recent sold listings from SoldComps, filters to exact card/grade/parallel, and returns last 10 comps + 30d volume."""
     url = "https://api.sold-comps.com/v1/scrape"
     headers = {"Authorization": f"Bearer {api_key.strip()}"}
     params = {"keyword": search_query, "ebaySite": "ebay.com"}
@@ -199,8 +233,8 @@ def fetch_sold_comps_auto(
 
     for item in items:
         title = item.get("title", "")
-        if not matches_parallel_filter(
-            title, mode, specific_parallel, exclude_csv, exclude_numbered,
+        if not matches_card_filter(
+            title, condition_type, grade, mode, specific_parallel, exclude_csv, exclude_numbered,
             player=player, card_set=card_set, card_num=card_num
         ):
             continue
@@ -248,6 +282,32 @@ def is_off_peak_est(end_date_str):
     return 2 <= dt_est.hour < 7
 
 # --- Main Input Section ---
+cond_col1, cond_col2 = st.columns([1.5, 2.5])
+with cond_col1:
+    card_condition = st.radio(
+        "Card Condition",
+        ["Graded", "Raw (Ungraded)"],
+        horizontal=True
+    )
+
+target_grade = ""
+if card_condition == "Graded":
+    with cond_col2:
+        g_col1, g_col2 = st.columns([1.5, 1.5])
+        with g_col1:
+            grade_choice = st.selectbox(
+                "Target Grade",
+                ["PSA 10", "PSA 9", "PSA 8", "BGS 9.5", "BGS 9", "SGC 10", "SGC 9.5", "CGC 10", "Custom..."],
+                index=0
+            )
+        if grade_choice == "Custom...":
+            with g_col2:
+                target_grade = st.text_input("Custom Grade", placeholder="e.g., PSA 7, BGS 10, TAG 10").strip()
+        else:
+            target_grade = grade_choice
+
+active_fallback_ship = default_slab_shipping if card_condition == "Graded" else default_raw_shipping
+
 col1, col2, col3, col4 = st.columns([2, 2, 1.3, 1.7])
 with col1:
     player_name = st.text_input("Player Name", placeholder="e.g., Joe Burrow")
@@ -306,13 +366,17 @@ if st.button("Scan eBay Market", type="primary"):
         st.error("Please enter your eBay App ID and Cert ID in the sidebar.")
     elif not player_name or not set_name:
         st.warning("Please enter both a Player Name and Set Name.")
+    elif card_condition == "Graded" and not target_grade:
+        st.warning("Please enter a Custom Grade (or pick one from the Target Grade dropdown).")
     elif parallel_mode == "Specific Parallel" and not specific_parallel.strip():
         st.warning("Please enter a Target Parallel Keyword (or switch to Base Only).")
     else:
         base_query = build_search_query(
-            player_name, set_name, "PSA 10", parallel_mode, specific_parallel, exclude_keywords, card_num=card_number
+            player_name, set_name, card_condition, target_grade,
+            parallel_mode, specific_parallel, exclude_keywords, card_num=card_number
         )
-        st.caption(f"Query sent to APIs: `{base_query}`")
+        condition_label = target_grade if card_condition == "Graded" else "Raw (Ungraded)"
+        st.caption(f"Scanning **{condition_label}** | Query sent to APIs: `{base_query}`")
 
         # 1. Get Last 10 Sold Comps (Auto via SoldComps or Manual Override)
         raw_comps = []
@@ -320,8 +384,9 @@ if st.button("Scan eBay Market", type="primary"):
             try:
                 with st.spinner("Pulling & filtering last 10 sold comps from SoldComps..."):
                     raw_comps, auto_sold_30d = fetch_sold_comps_auto(
-                        SOLDCOMPS_API_KEY, base_query, default_shipping,
-                        parallel_mode, specific_parallel, exclude_keywords, exclude_numbered,
+                        SOLDCOMPS_API_KEY, base_query, active_fallback_ship,
+                        card_condition, target_grade, parallel_mode, specific_parallel,
+                        exclude_keywords, exclude_numbered,
                         player=player_name, card_set=set_name, card_num=card_number
                     )
                     if auto_sold_30d > 0:
@@ -375,8 +440,9 @@ if st.button("Scan eBay Market", type="primary"):
                 raw_bin_items = bin_data.get("itemSummaries", [])
                 bin_items = [
                     it for it in raw_bin_items
-                    if matches_parallel_filter(
-                        it.get("title", ""), parallel_mode, specific_parallel, exclude_keywords, exclude_numbered,
+                    if matches_card_filter(
+                        it.get("title", ""), card_condition, target_grade, parallel_mode, specific_parallel,
+                        exclude_keywords, exclude_numbered,
                         player=player_name, card_set=set_name, card_num=card_number
                     )
                 ]
@@ -400,7 +466,7 @@ if st.button("Scan eBay Market", type="primary"):
                 tab1, tab2, tab3, tab4 = st.tabs([
                     "🎯 Buy It Now & Stale Best Offers",
                     "⏰ Off-Peak / Low-Bid Auctions",
-                    "⚖️ Cross-Grade Spreads",
+                    "⚖️ Cross-Grade & Raw Spreads",
                     "🔍 Broad / Missing Specifics"
                 ])
 
@@ -408,7 +474,7 @@ if st.button("Scan eBay Market", type="primary"):
                 with tab1:
                     rows = []
                     for item in bin_items:
-                        price, ship, total = parse_total_cost(item, default_shipping)
+                        price, ship, total = parse_total_cost(item, active_fallback_ship)
                         buying_opts = item.get("buyingOptions", [])
                         has_bo = "BEST_OFFER" in buying_opts
                         age_days = days_since_listed(item.get("itemCreationDate"))
@@ -450,7 +516,7 @@ if st.button("Scan eBay Market", type="primary"):
                             use_container_width=True
                         )
                     else:
-                        st.info("No active Buy It Now listings found matching this card and parallel.")
+                        st.info(f"No active {condition_label} Buy It Now listings found matching this card and parallel.")
 
                 # TAB 2: Off-Peak Auctions with Low Bids
                 with tab2:
@@ -460,8 +526,9 @@ if st.button("Scan eBay Market", type="primary"):
                     auc_data = search_browse_api(token, base_query, filter_str=auc_filter, sort="endingSoonest", limit=50)
                     auc_items = [
                         it for it in auc_data.get("itemSummaries", [])
-                        if matches_parallel_filter(
-                            it.get("title", ""), parallel_mode, specific_parallel, exclude_keywords, exclude_numbered,
+                        if matches_card_filter(
+                            it.get("title", ""), card_condition, target_grade, parallel_mode, specific_parallel,
+                            exclude_keywords, exclude_numbered,
                             player=player_name, card_set=set_name, card_num=card_number
                         )
                     ]
@@ -470,7 +537,7 @@ if st.button("Scan eBay Market", type="primary"):
                     for item in auc_items:
                         bids = item.get("bidCount", 0)
                         if bids <= max_auction_bids:
-                            _, _, total = parse_total_cost(item, default_shipping)
+                            _, _, total = parse_total_cost(item, active_fallback_ship)
                             end_str = item.get("itemEndDate", "")
                             off_peak = is_off_peak_est(end_str)
                             auc_rows.append({
@@ -490,35 +557,58 @@ if st.button("Scan eBay Market", type="primary"):
                             use_container_width=True
                         )
                     else:
-                        st.info(f"No low-bid auctions ending within {auction_hours_left} hours for this card and parallel.")
+                        st.info(f"No low-bid {condition_label} auctions ending within {auction_hours_left} hours.")
 
-                # TAB 3: Cross-Grade & Cross-Company Spreads
+                # TAB 3: Cross-Grade & Raw Spreads
                 with tab3:
-                    grades = ["PSA 9", "BGS 9.5", "SGC 10"]
+                    benchmark_targets = [
+                        ("Graded", "PSA 10"),
+                        ("Graded", "PSA 9"),
+                        ("Graded", "BGS 9.5"),
+                        ("Graded", "SGC 10"),
+                        ("Raw (Ungraded)", "")
+                    ]
                     spread_rows = []
-                    for g in grades:
-                        g_query = build_search_query(
-                            player_name, set_name, g, parallel_mode, specific_parallel, exclude_keywords, card_num=card_number
+                    for b_cond, b_grade in benchmark_targets:
+                        if b_cond == card_condition and b_grade.lower() == target_grade.lower():
+                            continue
+
+                        b_label = b_grade if b_cond == "Graded" else "Raw (Ungraded)"
+                        b_ship = default_slab_shipping if b_cond == "Graded" else default_raw_shipping
+                        b_query = build_search_query(
+                            player_name, set_name, b_cond, b_grade, parallel_mode, specific_parallel,
+                            exclude_keywords, card_num=card_number
                         )
-                        g_data = search_browse_api(
-                            token, g_query, filter_str="buyingOptions:{FIXED_PRICE}", sort="price", limit=15
+                        b_data = search_browse_api(
+                            token, b_query, filter_str="buyingOptions:{FIXED_PRICE}", sort="price", limit=15
                         )
-                        g_items = [
-                            it for it in g_data.get("itemSummaries", [])
-                            if matches_parallel_filter(
-                                it.get("title", ""), parallel_mode, specific_parallel, exclude_keywords, exclude_numbered,
+                        b_items = [
+                            it for it in b_data.get("itemSummaries", [])
+                            if matches_card_filter(
+                                it.get("title", ""), b_cond, b_grade, parallel_mode, specific_parallel,
+                                exclude_keywords, exclude_numbered,
                                 player=player_name, card_set=set_name, card_num=card_number
                             )
                         ]
-                        if g_items:
-                            _, _, lowest_total = parse_total_cost(g_items[0], default_shipping)
-                            spread = (avg_comp - lowest_total) if avg_comp > 0 else 0.0
+                        if b_items:
+                            _, _, lowest_total = parse_total_cost(b_items[0], b_ship)
+                            if avg_comp > 0:
+                                diff = (lowest_total - avg_comp) if card_condition == "Raw (Ungraded)" else (avg_comp - lowest_total)
+                                diff_display = round(diff, 2)
+                            else:
+                                diff_display = "Set Comps"
+
+                            spread_col_name = (
+                                "Upside vs Raw Avg Comp ($)"
+                                if card_condition == "Raw (Ungraded)"
+                                else f"Discount vs {condition_label} Avg Comp ($)"
+                            )
                             spread_rows.append({
-                                "Grade": g,
+                                "Condition / Grade": b_label,
                                 "Lowest BIN + Ship ($)": round(lowest_total, 2),
-                                "Spread vs PSA 10 Avg Comp ($)": round(spread, 2) if avg_comp else "Set Comps",
-                                "Top Listing": g_items[0].get("title", ""),
-                                "URL": g_items[0].get("itemWebUrl", "")
+                                spread_col_name: diff_display,
+                                "Top Listing": b_items[0].get("title", ""),
+                                "URL": b_items[0].get("itemWebUrl", "")
                             })
                     if spread_rows:
                         st.dataframe(
@@ -528,13 +618,14 @@ if st.button("Scan eBay Market", type="primary"):
                             use_container_width=True
                         )
                     else:
-                        st.info("No comparable PSA 9, BGS 9.5, or SGC 10 listings found for this card and parallel.")
+                        st.info("No comparable cross-grade or raw listings found for this card and parallel.")
 
                 # TAB 4: Broad Search / Missing Item Specifics
                 with tab4:
                     last_name = player_name.strip().split()[-1]
                     broad_query = build_search_query(
-                        last_name, "", "PSA 10", parallel_mode, specific_parallel, exclude_keywords, card_num=card_number
+                        last_name, "", card_condition, target_grade, parallel_mode, specific_parallel,
+                        exclude_keywords, card_num=card_number
                     )
                     broad_data = search_browse_api(
                         token, broad_query, filter_str="buyingOptions:{FIXED_PRICE}", sort="newlyListed", limit=50
@@ -545,13 +636,14 @@ if st.button("Scan eBay Market", type="primary"):
 
                     for item in broad_data.get("itemSummaries", []):
                         title = item.get("title", "")
-                        if not matches_parallel_filter(
-                            title, parallel_mode, specific_parallel, exclude_keywords, exclude_numbered,
+                        if not matches_card_filter(
+                            title, card_condition, target_grade, parallel_mode, specific_parallel,
+                            exclude_keywords, exclude_numbered,
                             player=player_name, card_set=set_name, card_num=card_number
                         ):
                             continue
                         if set_keyword not in title.lower() or len(title) < 40:
-                            _, _, total = parse_total_cost(item, default_shipping)
+                            _, _, total = parse_total_cost(item, active_fallback_ship)
                             broad_rows.append({
                                 "Title": title,
                                 "Total ($)": round(total, 2),
@@ -566,7 +658,7 @@ if st.button("Scan eBay Market", type="primary"):
                             use_container_width=True
                         )
                     else:
-                        st.info("No poorly titled or missing-specifics listings flagged for this card and parallel.")
+                        st.info(f"No poorly titled or missing-specifics {condition_label} listings flagged.")
 
         except Exception as e:
             st.error(f"eBay API Error: {e}")
