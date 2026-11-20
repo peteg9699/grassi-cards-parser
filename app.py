@@ -12,8 +12,9 @@ st.title("📈 Grassi Cards: Pro Arbitrage Scanner")
 
 DEFAULT_BASE_EXCLUDES = (
     "refractor, auto, autograph, mojo, shimmer, speckle, raywave, sapphire, mega, "
-    "silver, prizm, holo, x-fractor, xfractor, atomic, lava, wave, ice, hyper, "
-    "scope, disco, mosaic, checkerboard, tiger, zebra, gold, blue, green, purple, "
+    "silver, holo, x-fractor, xfractor, atomic, lava, wave, ice, hyper, "
+    "scope, disco, mosaic, checkerboard, tiger, zebra, lazer, pulsar, snakeskin, "
+    "negative, variation, genesis, pandora, gold, blue, green, purple, "
     "orange, red, pink, black, aqua, yellow, fuchsia, platinum, superfractor, "
     "printing plate, numbered"
 )
@@ -57,10 +58,31 @@ with st.sidebar:
     max_auction_bids = st.number_input("Low-Bid Auction Max Bids", value=5, step=1)
     auction_hours_left = st.number_input("Auctions Ending Within (Hours)", value=3, step=1)
 
-# --- Parallel & Query Filtering Helpers ---
-def build_search_query(player, card_set, grade, mode, specific_parallel, exclude_csv):
-    """Builds the search query with positive parallel terms and API negative exclusions."""
-    parts = [player.strip(), card_set.strip()]
+# --- Parallel, Card Number & Query Filtering Helpers ---
+def get_effective_excludes(exclude_csv, player="", card_set="", specific_parallel=""):
+    """Prevents an exclusion word from blocking terms that belong to the Set Name or Player Name."""
+    if not exclude_csv.strip():
+        return []
+    protected_text = f"{player} {card_set} {specific_parallel}".lower()
+    protected_words = set(re.findall(r"\b\w+\b", protected_text))
+
+    effective = []
+    for word in exclude_csv.split(","):
+        w = word.strip()
+        if not w:
+            continue
+        if w.lower() in protected_words or re.search(rf"\b{re.escape(w)}\b", protected_text, re.IGNORECASE):
+            continue
+        effective.append(w)
+    return effective
+
+def build_search_query(player, card_set, grade, mode, specific_parallel, exclude_csv, card_num=""):
+    """Builds the search query with positive parallel terms, card number, and API negative exclusions."""
+    parts = [player.strip()]
+    if card_set and card_set.strip():
+        parts.append(card_set.strip())
+    if card_num and card_num.strip():
+        parts.append(card_num.strip().lstrip("#").strip())
     if mode == "Specific Parallel" and specific_parallel.strip():
         parts.append(specific_parallel.strip())
     if grade:
@@ -68,19 +90,27 @@ def build_search_query(player, card_set, grade, mode, specific_parallel, exclude
 
     query = " ".join(parts)
 
-    # Append negative keywords (keep well under eBay's 350-char query limit)
-    if mode in ("Base Only", "Specific Parallel") and exclude_csv.strip():
-        excludes = [w.strip() for w in exclude_csv.split(",") if w.strip() and " " not in w.strip()]
-        neg_tokens = [f"-{w}" for w in excludes[:18]]
+    if mode in ("Base Only", "Specific Parallel"):
+        excludes = get_effective_excludes(exclude_csv, player, card_set, specific_parallel)
+        single_word_excludes = [w for w in excludes if " " not in w]
+        neg_tokens = [f"-{w}" for w in single_word_excludes[:18]]
         candidate = f"{query} {' '.join(neg_tokens)}".strip()
         if len(candidate) <= 320:
             query = candidate
 
     return query
 
-def matches_parallel_filter(title, mode, specific_parallel, exclude_csv, exclude_numbered):
-    """Whole-word title filter so 'red' excludes 'Red Refractor' without blocking 'Reds'."""
-    if not title:
+def matches_card_number(title, card_num):
+    """Matches #307, # 307, 307, or BCP-50 while ignoring serial numbers like /307."""
+    if not card_num or not card_num.strip():
+        return True
+    clean_num = card_num.strip().lstrip("#").strip()
+    pattern = rf"(?<!/)(?:^|[\s#(-])#?\s*{re.escape(clean_num)}\b"
+    return bool(re.search(pattern, title, re.IGNORECASE))
+
+def matches_parallel_filter(title, mode, specific_parallel, exclude_csv, exclude_numbered, player="", card_set="", card_num=""):
+    """Whole-word title filter that enforces card number and protects Set Name words."""
+    if not title or not matches_card_number(title, card_num):
         return False
 
     if mode == "Specific Parallel" and specific_parallel.strip():
@@ -91,11 +121,9 @@ def matches_parallel_filter(title, mode, specific_parallel, exclude_csv, exclude
         if exclude_numbered and re.search(r"(?:/|\bout of\s*)\d+", title, re.IGNORECASE):
             return False
 
-        if exclude_csv.strip():
-            for word in exclude_csv.split(","):
-                w = word.strip()
-                if w and re.search(rf"\b{re.escape(w)}\b", title, re.IGNORECASE):
-                    return False
+        for w in get_effective_excludes(exclude_csv, player, card_set, specific_parallel):
+            if re.search(rf"\b{re.escape(w)}\b", title, re.IGNORECASE):
+                return False
 
     return True
 
@@ -151,8 +179,11 @@ def get_item_watch_count(token, item_id):
         pass
     return "N/A"
 
-def fetch_sold_comps_auto(api_key, search_query, fallback_ship, mode, specific_parallel, exclude_csv, exclude_numbered):
-    """Fetches recent sold listings from SoldComps, filters to the exact parallel, and returns comps + 30d volume."""
+def fetch_sold_comps_auto(
+    api_key, search_query, fallback_ship, mode, specific_parallel,
+    exclude_csv, exclude_numbered, player="", card_set="", card_num=""
+):
+    """Fetches recent sold listings from SoldComps, filters to exact card & parallel, and returns last 10 comps + 30d volume."""
     url = "https://api.sold-comps.com/v1/scrape"
     headers = {"Authorization": f"Bearer {api_key.strip()}"}
     params = {"keyword": search_query, "ebaySite": "ebay.com"}
@@ -168,7 +199,10 @@ def fetch_sold_comps_auto(api_key, search_query, fallback_ship, mode, specific_p
 
     for item in items:
         title = item.get("title", "")
-        if not matches_parallel_filter(title, mode, specific_parallel, exclude_csv, exclude_numbered):
+        if not matches_parallel_filter(
+            title, mode, specific_parallel, exclude_csv, exclude_numbered,
+            player=player, card_set=card_set, card_num=card_num
+        ):
             continue
 
         raw_price = item.get("soldPrice") or item.get("price") or 0.0
@@ -188,7 +222,7 @@ def fetch_sold_comps_auto(api_key, search_query, fallback_ship, mode, specific_p
             except ValueError:
                 pass
 
-    return totals[:7], sold_30d
+    return totals[:10], sold_30d
 
 def parse_total_cost(item, fallback_ship):
     price = float(item.get("price", {}).get("value", 0.0))
@@ -214,12 +248,14 @@ def is_off_peak_est(end_date_str):
     return 2 <= dt_est.hour < 7
 
 # --- Main Input Section ---
-col1, col2, col3 = st.columns([2, 2, 2])
+col1, col2, col3, col4 = st.columns([2, 2, 1.3, 1.7])
 with col1:
-    player_name = st.text_input("Player Name", placeholder="e.g., Elly De La Cruz")
+    player_name = st.text_input("Player Name", placeholder="e.g., Joe Burrow")
 with col2:
-    set_name = st.text_input("Set Name", placeholder="e.g., 2022 Bowman Chrome")
+    set_name = st.text_input("Set Name", placeholder="e.g., 2020 Prizm")
 with col3:
+    card_number = st.text_input("Card # (Optional)", placeholder="e.g., 307 or BCP-50")
+with col4:
     parallel_mode = st.selectbox(
         "Parallel / Variation Filter",
         ["Base Only", "Specific Parallel", "All Parallels"],
@@ -230,7 +266,7 @@ specific_parallel = ""
 if parallel_mode == "Specific Parallel":
     specific_parallel = st.text_input(
         "Target Parallel Keyword",
-        placeholder="e.g., Refractor, Mojo, Blue Refractor, Silver Prizm"
+        placeholder="e.g., Silver, Mojo, Blue Refractor, Lazer"
     )
 
 if parallel_mode in ("Base Only", "Specific Parallel"):
@@ -249,9 +285,9 @@ else:
 c_comp1, c_comp2 = st.columns([3, 2])
 with c_comp1:
     comps_input = st.text_input(
-        "Manual Sold Comps Override (Optional, comma-separated $)",
+        "Manual Sold Comps Override (Optional, up to last 10 sales, comma-separated $)",
         placeholder="Auto-filled if SoldComps key is set",
-        help="Leave blank to use SoldComps automatically, or paste 5–7 sold totals manually."
+        help="Leave blank to use SoldComps automatically, or paste up to 10 recent sold totals manually."
     )
 with c_comp2:
     sold_30d_count = st.number_input(
@@ -274,51 +310,65 @@ if st.button("Scan eBay Market", type="primary"):
         st.warning("Please enter a Target Parallel Keyword (or switch to Base Only).")
     else:
         base_query = build_search_query(
-            player_name, set_name, "PSA 10", parallel_mode, specific_parallel, exclude_keywords
+            player_name, set_name, "PSA 10", parallel_mode, specific_parallel, exclude_keywords, card_num=card_number
         )
         st.caption(f"Query sent to APIs: `{base_query}`")
 
-        # 1. Get Sold Comps (Auto via SoldComps or Manual Override)
+        # 1. Get Last 10 Sold Comps (Auto via SoldComps or Manual Override)
         raw_comps = []
         if SOLDCOMPS_API_KEY and not comps_input.strip():
             try:
-                with st.spinner("Pulling & filtering live sold comps from SoldComps..."):
+                with st.spinner("Pulling & filtering last 10 sold comps from SoldComps..."):
                     raw_comps, auto_sold_30d = fetch_sold_comps_auto(
                         SOLDCOMPS_API_KEY, base_query, default_shipping,
-                        parallel_mode, specific_parallel, exclude_keywords, exclude_numbered
+                        parallel_mode, specific_parallel, exclude_keywords, exclude_numbered,
+                        player=player_name, card_set=set_name, card_num=card_number
                     )
                     if auto_sold_30d > 0:
                         sold_30d_count = auto_sold_30d
-                    if raw_comps:
-                        st.caption(f"Filtered recent comps ({len(raw_comps)}): {', '.join(f'${c:.2f}' for c in raw_comps)}")
             except Exception as e:
                 st.warning(f"SoldComps lookup failed ({e}). Falling back to manual comps.")
         elif comps_input.strip():
             try:
-                raw_comps = [float(x.strip().replace("$", "")) for x in comps_input.split(",") if x.strip()]
+                raw_comps = [float(x.strip().replace("$", "")) for x in comps_input.split(",") if x.strip()][:10]
             except ValueError:
                 st.error("Invalid format in Sold Comps. Use numbers separated by commas.")
                 st.stop()
 
-        # Median & Outlier-Protected Trimmed Average
-        if len(raw_comps) >= 3:
-            median_comp = statistics.median(raw_comps)
-            sorted_comps = sorted(raw_comps)
-            trimmed_avg = sum(sorted_comps[1:-1]) / len(sorted_comps[1:-1])
-        elif raw_comps:
-            median_comp = statistics.median(raw_comps)
-            trimmed_avg = sum(raw_comps) / len(raw_comps)
+        # Drop Highest & Lowest of Last 10 Sales to Determine Average Comp
+        recent_sales = raw_comps[:10]
+        trimmed_comps = []
+        if len(recent_sales) >= 3:
+            sorted_comps = sorted(recent_sales)
+            dropped_low = sorted_comps[0]
+            dropped_high = sorted_comps[-1]
+            trimmed_comps = sorted_comps[1:-1]
+            avg_comp = sum(trimmed_comps) / len(trimmed_comps)
+            median_comp = statistics.median(recent_sales)
+            st.caption(
+                f"Last {len(recent_sales)} comps: {', '.join(f'${c:.2f}' for c in recent_sales)} "
+                f"| Dropped Low: **${dropped_low:.2f}** & High: **${dropped_high:.2f}** "
+                f"(Averaging middle {len(trimmed_comps)} sales)"
+            )
+        elif recent_sales:
+            trimmed_comps = recent_sales
+            avg_comp = sum(recent_sales) / len(recent_sales)
+            median_comp = statistics.median(recent_sales)
+            st.caption(
+                f"Found {len(recent_sales)} comp(s): {', '.join(f'${c:.2f}' for c in recent_sales)} "
+                f"(Need at least 3 sales to drop high & low)"
+            )
         else:
+            avg_comp = 0.0
             median_comp = 0.0
-            trimmed_avg = 0.0
 
-        target_buy_price = median_comp * (1 - discount_pct / 100.0) if median_comp > 0 else 0.0
+        target_buy_price = avg_comp * (1 - discount_pct / 100.0) if avg_comp > 0 else 0.0
 
         try:
             with st.spinner("Connecting to eBay Browse API & scanning all 8 signals..."):
                 token = get_ebay_oauth_token(EBAY_APP_ID, EBAY_CERT_ID)
 
-                # Active Buy It Now Listings (fetch up to 100 so post-filtering still leaves plenty)
+                # Active Buy It Now Listings
                 bin_data = search_browse_api(
                     token, base_query, filter_str="buyingOptions:{FIXED_PRICE}", sort="newlyListed", limit=100
                 )
@@ -326,7 +376,8 @@ if st.button("Scan eBay Market", type="primary"):
                 bin_items = [
                     it for it in raw_bin_items
                     if matches_parallel_filter(
-                        it.get("title", ""), parallel_mode, specific_parallel, exclude_keywords, exclude_numbered
+                        it.get("title", ""), parallel_mode, specific_parallel, exclude_keywords, exclude_numbered,
+                        player=player_name, card_set=set_name, card_num=card_number
                     )
                 ]
                 total_active = len(bin_items) if len(raw_bin_items) < 100 else bin_data.get("total", len(bin_items))
@@ -336,8 +387,12 @@ if st.button("Scan eBay Market", type="primary"):
 
                 # Top-Level KPI Row
                 m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Median Comp", f"${median_comp:.2f}" if median_comp else "Not Set")
-                m2.metric("Trimmed Avg (No Outliers)", f"${trimmed_avg:.2f}" if trimmed_avg else "Not Set")
+                m1.metric(
+                    "Avg Comp (Excl. High/Low)",
+                    f"${avg_comp:.2f}" if avg_comp else "Not Set",
+                    f"Middle {len(trimmed_comps)} of {len(recent_sales)} sales" if len(recent_sales) >= 3 else None
+                )
+                m2.metric("Median Comp", f"${median_comp:.2f}" if median_comp else "Not Set")
                 m3.metric(f"Target Buy ({discount_pct}% Off)", f"${target_buy_price:.2f}" if target_buy_price else "Not Set")
                 m4.metric("Sell-Through Rate", f"{str_pct:.1f}%", f"{sold_30d_count} sold / {total_active} active")
 
@@ -395,7 +450,7 @@ if st.button("Scan eBay Market", type="primary"):
                             use_container_width=True
                         )
                     else:
-                        st.info("No active Buy It Now listings found matching this parallel.")
+                        st.info("No active Buy It Now listings found matching this card and parallel.")
 
                 # TAB 2: Off-Peak Auctions with Low Bids
                 with tab2:
@@ -406,7 +461,8 @@ if st.button("Scan eBay Market", type="primary"):
                     auc_items = [
                         it for it in auc_data.get("itemSummaries", [])
                         if matches_parallel_filter(
-                            it.get("title", ""), parallel_mode, specific_parallel, exclude_keywords, exclude_numbered
+                            it.get("title", ""), parallel_mode, specific_parallel, exclude_keywords, exclude_numbered,
+                            player=player_name, card_set=set_name, card_num=card_number
                         )
                     ]
 
@@ -434,15 +490,15 @@ if st.button("Scan eBay Market", type="primary"):
                             use_container_width=True
                         )
                     else:
-                        st.info(f"No low-bid auctions ending within {auction_hours_left} hours for this parallel.")
+                        st.info(f"No low-bid auctions ending within {auction_hours_left} hours for this card and parallel.")
 
-                # TAB 3: Cross-Grade & Cross-Company Spreads (Filtered to Same Parallel)
+                # TAB 3: Cross-Grade & Cross-Company Spreads
                 with tab3:
                     grades = ["PSA 9", "BGS 9.5", "SGC 10"]
                     spread_rows = []
                     for g in grades:
                         g_query = build_search_query(
-                            player_name, set_name, g, parallel_mode, specific_parallel, exclude_keywords
+                            player_name, set_name, g, parallel_mode, specific_parallel, exclude_keywords, card_num=card_number
                         )
                         g_data = search_browse_api(
                             token, g_query, filter_str="buyingOptions:{FIXED_PRICE}", sort="price", limit=15
@@ -450,16 +506,17 @@ if st.button("Scan eBay Market", type="primary"):
                         g_items = [
                             it for it in g_data.get("itemSummaries", [])
                             if matches_parallel_filter(
-                                it.get("title", ""), parallel_mode, specific_parallel, exclude_keywords, exclude_numbered
+                                it.get("title", ""), parallel_mode, specific_parallel, exclude_keywords, exclude_numbered,
+                                player=player_name, card_set=set_name, card_num=card_number
                             )
                         ]
                         if g_items:
                             _, _, lowest_total = parse_total_cost(g_items[0], default_shipping)
-                            spread = (median_comp - lowest_total) if median_comp > 0 else 0.0
+                            spread = (avg_comp - lowest_total) if avg_comp > 0 else 0.0
                             spread_rows.append({
                                 "Grade": g,
                                 "Lowest BIN + Ship ($)": round(lowest_total, 2),
-                                "Spread vs PSA 10 Median ($)": round(spread, 2) if median_comp else "Set Comps",
+                                "Spread vs PSA 10 Avg Comp ($)": round(spread, 2) if avg_comp else "Set Comps",
                                 "Top Listing": g_items[0].get("title", ""),
                                 "URL": g_items[0].get("itemWebUrl", "")
                             })
@@ -471,13 +528,13 @@ if st.button("Scan eBay Market", type="primary"):
                             use_container_width=True
                         )
                     else:
-                        st.info("No comparable PSA 9, BGS 9.5, or SGC 10 listings found for this parallel.")
+                        st.info("No comparable PSA 9, BGS 9.5, or SGC 10 listings found for this card and parallel.")
 
                 # TAB 4: Broad Search / Missing Item Specifics
                 with tab4:
                     last_name = player_name.strip().split()[-1]
                     broad_query = build_search_query(
-                        last_name, "", "PSA 10", parallel_mode, specific_parallel, exclude_keywords
+                        last_name, "", "PSA 10", parallel_mode, specific_parallel, exclude_keywords, card_num=card_number
                     )
                     broad_data = search_browse_api(
                         token, broad_query, filter_str="buyingOptions:{FIXED_PRICE}", sort="newlyListed", limit=50
@@ -488,7 +545,10 @@ if st.button("Scan eBay Market", type="primary"):
 
                     for item in broad_data.get("itemSummaries", []):
                         title = item.get("title", "")
-                        if not matches_parallel_filter(title, parallel_mode, specific_parallel, exclude_keywords, exclude_numbered):
+                        if not matches_parallel_filter(
+                            title, parallel_mode, specific_parallel, exclude_keywords, exclude_numbered,
+                            player=player_name, card_set=set_name, card_num=card_number
+                        ):
                             continue
                         if set_keyword not in title.lower() or len(title) < 40:
                             _, _, total = parse_total_cost(item, default_shipping)
@@ -506,7 +566,7 @@ if st.button("Scan eBay Market", type="primary"):
                             use_container_width=True
                         )
                     else:
-                        st.info("No poorly titled or missing-specifics listings flagged for this parallel.")
+                        st.info("No poorly titled or missing-specifics listings flagged for this card and parallel.")
 
         except Exception as e:
             st.error(f"eBay API Error: {e}")
