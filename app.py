@@ -9,19 +9,35 @@ from datetime import datetime, timezone, timedelta
 st.set_page_config(page_title="Grassi Cards: Pro Arbitrage Scanner", layout="wide")
 st.title("📈 Grassi Cards: Pro Arbitrage Scanner")
 
+def load_secret(key_name):
+    """Safely reads from st.secrets without crashing if no secrets file exists."""
+    try:
+        return st.secrets.get(key_name, "")
+    except Exception:
+        return ""
+
 # --- Sidebar: API & Strategy Settings ---
 with st.sidebar:
     st.header("🔑 eBay Browse API Credentials")
-    EBAY_APP_ID = st.text_input("App ID (Client ID)", type="password")
-    EBAY_CERT_ID = st.text_input("Cert ID (Client Secret)", type="password")
+    EBAY_APP_ID = st.text_input(
+        "App ID (Client ID)",
+        value=load_secret("EBAY_APP_ID"),
+        type="password"
+    ).strip()
+    EBAY_CERT_ID = st.text_input(
+        "Cert ID (Client Secret)",
+        value=load_secret("EBAY_CERT_ID"),
+        type="password"
+    ).strip()
 
     st.divider()
     st.header("📊 SoldComps API (Auto-Comps)")
     SOLDCOMPS_API_KEY = st.text_input(
         "SoldComps API Key (Optional)",
+        value=load_secret("SOLDCOMPS_API_KEY"),
         type="password",
         help="Leave blank to enter sold comps manually."
-    )
+    ).strip()
 
     st.divider()
     st.header("⚙️ Deal & Filter Settings")
